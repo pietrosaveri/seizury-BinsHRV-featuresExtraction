@@ -1190,48 +1190,134 @@ class DataProcessingPipeline:
         # Results storage
         self.processing_results = []
         
+    def _validate_seizures(self, seizure_events: pd.DataFrame, recording_duration: float) -> pd.DataFrame:
+        """
+        Validate seizures based on timing criteria.
+        
+        Args:
+            seizure_events: DataFrame with 'onset' and optionally 'duration' columns
+            recording_duration: Total duration of recording in seconds
+            
+        Returns:
+            DataFrame with only valid seizures
+        """
+        if seizure_events.empty:
+            return seizure_events
+        
+        # Make a copy to avoid modifying original
+        seizures = seizure_events.copy()
+        seizures = seizures.sort_values('onset').reset_index(drop=True)
+        
+        valid_seizures = []
+        
+        for idx, seizure in seizures.iterrows():
+            onset_time = seizure['onset']
+            is_valid = True
+            
+            # Criterion 1: Must be at least 20 minutes from start of recording
+            if onset_time < 20 * 60:  # 20 minutes = 1200 seconds
+                is_valid = False
+                continue
+                
+            # Criterion 2: Must not be within 30-minute post-ictal phase of another VALID seizure
+            # Only check against seizures we've already validated as valid
+            for valid_seizure in valid_seizures:
+                valid_onset = valid_seizure['onset']
+                time_since_valid = (onset_time - valid_onset) / 60.0  # Convert to minutes
+                
+                # If current seizure is within 30 minutes of a valid previous seizure, it's invalid
+                if 0 < time_since_valid <= 30:
+                    is_valid = False
+                    break
+            
+            if is_valid:
+                valid_seizures.append(seizure)
+        
+        if valid_seizures:
+            return pd.DataFrame(valid_seizures).reset_index(drop=True)
+        else:
+            return pd.DataFrame()
+
     def _count_seizures_per_patient(self, matched_runs):
-        """Count total seizures per patient across all runs."""
+        """Count total VALID seizures per patient across all runs."""
         patient_seizure_counts = {}
+        patient_valid_counts = {}
+        patient_total_counts = {}
         
         print("Analyzing seizure distribution across patients...")
+        print("Only counting seizures that are:")
+        print("  - At least 20 minutes from recording start")
+        print("  - Not within 30-minute post-ictal phase of another seizure")
         
         for run_data in matched_runs:
             subject_id = run_data['subject']
             
             if subject_id not in patient_seizure_counts:
                 patient_seizure_counts[subject_id] = 0
+                patient_valid_counts[subject_id] = 0
+                patient_total_counts[subject_id] = 0
             
             # Count seizures in this run
             if run_data['annotation_file']:
                 try:
-                    seizure_events = self.annotation_processor.load_annotations(run_data['annotation_file'])
-                    patient_seizure_counts[subject_id] += len(seizure_events)
+                    # Load all seizures
+                    all_seizures = self.annotation_processor.load_annotations(run_data['annotation_file'])
+                    patient_total_counts[subject_id] += len(all_seizures)
+                    
+                    if len(all_seizures) > 0:
+                        # Get recording duration (approximate from ECG file if available)
+                        recording_duration = 24 * 3600  # Default to 24 hours
+                        if run_data['ecg_file']:
+                            # Try to get actual duration - for now use default
+                            pass
+                        
+                        # Validate seizures
+                        valid_seizures = self._validate_seizures(all_seizures, recording_duration)
+                        patient_seizure_counts[subject_id] += len(valid_seizures)
+                        patient_valid_counts[subject_id] += len(valid_seizures)
+                        
+                        # Debug output for recordings with seizures
+                        if len(all_seizures) > len(valid_seizures):
+                            excluded = len(all_seizures) - len(valid_seizures)
+                            print(f"  {subject_id}: {len(all_seizures)} total seizures, {len(valid_seizures)} valid ({excluded} excluded)")
+                            
                 except Exception as e:
                     print(f"  Warning: Could not load annotations for {subject_id}: {e}")
+        
+        # Print validation summary
+        total_patients = len([p for p in patient_total_counts.values() if p > 0])
+        total_seizures = sum(patient_total_counts.values())
+        valid_seizures = sum(patient_valid_counts.values())
+        
+        if total_seizures > 0:
+            print(f"\nSeizure Validation Summary:")
+            print(f"  Patients with seizures: {total_patients}")
+            print(f"  Total seizures found: {total_seizures}")
+            print(f"  Valid seizures: {valid_seizures} ({valid_seizures/total_seizures*100:.1f}%)")
+            print(f"  Excluded seizures: {total_seizures - valid_seizures}")
                     
         return patient_seizure_counts
     
     def _select_top_patients(self, matched_runs, patient_seizure_counts, top_n):
-        """Select only runs from patients with the most seizures."""
-        # Sort patients by seizure count (descending)
+        """Select only runs from patients with the most VALID seizures."""
+        # Sort patients by valid seizure count (descending)
         sorted_patients = sorted(patient_seizure_counts.items(), 
                                key=lambda x: x[1], reverse=True)
         
-        print(f"\nPatient seizure distribution:")
+        print(f"\nPatient valid seizure distribution:")
         for i, (patient_id, count) in enumerate(sorted_patients[:10]):  # Show top 10
-            print(f"  {i+1}. {patient_id}: {count} seizures")
+            print(f"  {i+1}. {patient_id}: {count} valid seizures")
         
         if len(sorted_patients) > 10:
             print(f"  ... and {len(sorted_patients) - 10} more patients")
             
-        # Select top N patients
+        # Select top N patients based on valid seizure count
         top_patients = [patient_id for patient_id, count in sorted_patients[:top_n]]
         
-        print(f"\nSelected top {top_n} patients with most seizures:")
+        print(f"\nSelected top {top_n} patients with most valid seizures:")
         for patient_id in top_patients:
             count = patient_seizure_counts[patient_id]
-            print(f"  {patient_id}: {count} seizures")
+            print(f"  {patient_id}: {count} valid seizures")
         
         # Filter runs to only include selected patients
         filtered_runs = [run for run in matched_runs if run['subject'] in top_patients]
@@ -1250,7 +1336,7 @@ class DataProcessingPipeline:
         print(f"  Seizure proximity bins: 0-5min, 5-30min, 30-60min, >60min")
         print(f"  Parallel workers: {self.n_workers}")
         if self.top_n_patients:
-            print(f"  Patient selection: Top {self.top_n_patients} patients with most seizures")
+            print(f"  Patient selection: Top {self.top_n_patients} patients with most valid seizures")
         
         # Step 1: Discover data
         start_time = time.time()
@@ -1262,7 +1348,7 @@ class DataProcessingPipeline:
         discovery_time = time.time() - start_time
         print(f"Discovery completed in {discovery_time:.2f}s")
         
-        # Step 1.5: Optional patient selection based on seizure count
+        # Step 1.5: Optional patient selection based on valid seizure count
         if self.top_n_patients:
             patient_seizure_counts = self._count_seizures_per_patient(matched_runs)
             matched_runs = self._select_top_patients(matched_runs, patient_seizure_counts, self.top_n_patients)
@@ -1520,7 +1606,7 @@ def main():
     parser.add_argument('--output-dir', type=str,
                        help='Output directory (default: /Volumes/Seizury/HRV/hrv_features)')
     parser.add_argument('--top-n-patients', type=int, default=None,
-                       help='Select only top N patients with most seizures')
+                       help='Select only top N patients with most valid seizures (≥20min from start, not in 30min post-ictal)')
     parser.add_argument('--n-workers', type=int, default=2,
                        help='Number of parallel workers (default: 2)')
     parser.add_argument('--no-parallel', action='store_true',
@@ -1545,7 +1631,7 @@ def main():
     print(f"Output destination: {output_dir}")
     print(f"Parallel processing: {use_parallel} ({n_workers} workers)")
     if top_n_patients:
-        print(f"Patient selection: Top {top_n_patients} patients with most seizures")
+        print(f"Patient selection: Top {top_n_patients} patients with most valid seizures")
     
     # Pre-initialize S3 connection to avoid repeated messages
     S3FileHandler.initialize_s3_connection()

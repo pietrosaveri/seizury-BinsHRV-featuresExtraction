@@ -1313,12 +1313,12 @@ def main():
     args = parser.parse_args()
     
     # Configuration - LOCAL FILES (comment out if using S3)
-    data_root = args.data_root or "/Volumes/Seizury/ds005873"
-    output_dir = args.output_dir or "/Volumes/Seizury/HRV/60min_overlapping_hrv_features"
+    #data_root = args.data_root or "/Volumes/Seizury/ds005873"
+    #output_dir = args.output_dir or "/Volumes/Seizury/HRV/60min_overlapping_hrv_features"
 
     # Configuration - AWS S3 (comment out if using local files)
-    #data_root = args.data_root or "s3://seizury-data/ds005873"
-    #output_dir = args.output_dir or "s3://seizury-data/60min_overlapping_hrv_features"
+    data_root = args.data_root or "s3://seizury-data/ds005873"
+    output_dir = args.output_dir or "s3://seizury-data/60min_overlapping_hrv_features"
 
     # Performance settings for m7i-flex.large (2 vCPUs, 8GB RAM)
     n_workers = args.n_workers  # Use specified number of workers

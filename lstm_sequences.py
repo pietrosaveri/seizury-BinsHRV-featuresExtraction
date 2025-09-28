@@ -77,6 +77,11 @@ class LSTMSequenceBuilder:
         if missing_cols:
             raise ValueError(f"Missing required columns: {missing_cols}")
         
+        # Check for training mask column (optional for backward compatibility)
+        if 'training_mask' not in df.columns:
+            print("Warning: 'training_mask' column not found. All samples will be used for training.")
+            df['training_mask'] = 1
+        
         # Sort by time to ensure temporal order
         df = df.sort_values('minute_time').reset_index(drop=True)
         
@@ -96,13 +101,14 @@ class LSTMSequenceBuilder:
         metadata_cols = [
             'subject_id', 'recording_id', 'window_start_time', 
             'window_end_time', 'minute_time', 'minute_in_window',
-            'bin_1', 'bin_2', 'bin_3', 'bin_4', 'mask'
+            'bin_1', 'bin_2', 'bin_3', 'bin_4', 'mask', 'training_mask',
+            'is_ictal', 'is_postictal', 'recent_seizure_flag', 'is_padded'
         ]
         
         feature_cols = [col for col in df.columns if col not in metadata_cols]
         return feature_cols
     
-    def create_sequences_from_recording(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def create_sequences_from_recording(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         Create sequences from a single recording.
         
@@ -110,22 +116,24 @@ class LSTMSequenceBuilder:
             df: Features DataFrame for one recording
             
         Returns:
-            Tuple of (sequences, labels, timestamps) where:
+            Tuple of (sequences, labels, timestamps, train_masks) where:
             - sequences: (N, seq_len, n_features)
-            - labels: (N,) labels for each sequence
+            - labels: (N, 4) multi-class bin labels for each sequence
             - timestamps: (N,) center timestamps for each sequence
+            - train_masks: (N,) boolean mask for trainable sequences
         """
         if len(df) < self.seq_len:
-            return np.array([]), np.array([]), np.array([])
+            return np.array([]), np.array([]), np.array([]), np.array([])
         
         # Get feature columns
         if self.feature_names is None:
             self.feature_names = self.extract_feature_columns(df)
         
-        # Extract features and labels (now multi-class bins)
+        # Extract features, labels, and training masks
         features = df[self.feature_names].values  # (n_minutes, n_features)
         bin_labels = df[['bin_1', 'bin_2', 'bin_3', 'bin_4']].values  # (n_minutes, 4)
         timestamps = df['minute_time'].values
+        training_masks = df['training_mask'].values  # (n_minutes,)
         
         # Handle NaN values
         nan_mask = np.isnan(features).any(axis=1)
@@ -140,27 +148,41 @@ class LSTMSequenceBuilder:
         n_sequences = (n_windows - self.seq_len) // self.stride + 1
         
         if n_sequences <= 0:
-            return np.array([]), np.array([]), np.array([])
+            return np.array([]), np.array([]), np.array([]), np.array([])
         
         # Create sequences
-        sequences = np.zeros((n_sequences, self.seq_len, len(self.feature_names)))
-        seq_labels = np.zeros(n_sequences, dtype=int)
-        seq_timestamps = np.zeros(n_sequences)
+        sequences = []
+        seq_labels = []
+        seq_timestamps = []
+        seq_train_masks = []  # Track which sequences are trainable
         
         for i in range(n_sequences):
             start_idx = i * self.stride
             end_idx = start_idx + self.seq_len
             
-            # Extract sequence (history)
-            sequences[i] = features[start_idx:end_idx]
+            # Check if the target (last minute) is trainable
+            target_trainable = training_masks[end_idx - 1] == 1
             
-            # Label is from the last window in the sequence
-            seq_labels[i] = labels[end_idx - 1]
-            seq_timestamps[i] = timestamps[end_idx - 1]
+            # Extract sequence (history) and target label
+            sequence = features[start_idx:end_idx]
+            target_bins = bin_labels[end_idx - 1]  # Multi-class bin labels
+            timestamp = timestamps[end_idx - 1]
+            
+            # Store all sequences but mark training mask
+            sequences.append(sequence)
+            seq_labels.append(target_bins)
+            seq_timestamps.append(timestamp)
+            seq_train_masks.append(target_trainable)
         
-        return sequences, seq_labels, seq_timestamps
+        # Convert to numpy arrays
+        sequences = np.array(sequences)  # (n_sequences, seq_len, n_features)
+        seq_labels = np.array(seq_labels)  # (n_sequences, 4) - multi-class bins
+        seq_timestamps = np.array(seq_timestamps)
+        seq_train_masks = np.array(seq_train_masks, dtype=bool)
+        
+        return sequences, seq_labels, seq_timestamps, seq_train_masks
     
-    def create_sequences_from_csv(self, csv_path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def create_sequences_from_csv(self, csv_path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         Create sequences from features CSV file.
         
@@ -168,7 +190,7 @@ class LSTMSequenceBuilder:
             csv_path: Path to features CSV
             
         Returns:
-            Tuple of (sequences, labels, timestamps)
+            Tuple of (sequences, labels, timestamps, train_masks)
         """
         df = self.load_features_from_csv(csv_path)
         return self.create_sequences_from_recording(df)
@@ -191,6 +213,7 @@ class LSTMSequenceBuilder:
         all_sequences = []
         all_labels = []
         all_timestamps = []
+        all_train_masks = []
         all_subjects = []
         all_recordings = []
         
@@ -223,12 +246,13 @@ class LSTMSequenceBuilder:
                     self.logger.warning(f"Recording {recording_id} too short for sequences")
                     continue
                 
-                sequences, labels, timestamps = self.create_sequences_from_recording(recording_df)
+                sequences, labels, timestamps, train_masks = self.create_sequences_from_recording(recording_df)
                 
                 if len(sequences) > 0:
                     all_sequences.append(sequences)
                     all_labels.append(labels)
                     all_timestamps.append(timestamps)
+                    all_train_masks.append(train_masks)
                     
                     # Track metadata - ensure subject_id is string
                     if 'subject_id' in recording_df.columns:
@@ -261,6 +285,7 @@ class LSTMSequenceBuilder:
         X = np.vstack(all_sequences)
         y = np.concatenate(all_labels)
         timestamps = np.concatenate(all_timestamps)
+        train_masks = np.concatenate(all_train_masks)
         
         self.logger.info(f"Created {len(X)} sequences with shape {X.shape}")
         
@@ -276,12 +301,20 @@ class LSTMSequenceBuilder:
         class_weights = compute_class_weight('balanced', classes=np.unique(y), y=y)
         class_weight_dict = {i: w for i, w in enumerate(class_weights)}
         
+        # Calculate training statistics
+        n_trainable = train_masks.sum()
+        n_excluded = len(train_masks) - n_trainable
+        self.logger.info(f"Training sequences: {n_trainable}/{len(train_masks)} "
+                        f"({n_trainable/len(train_masks)*100:.1f}%)")
+        self.logger.info(f"Excluded (ictal/postictal): {n_excluded} ({n_excluded/len(train_masks)*100:.1f}%)")
+        
         # Save to HDF5 for efficient loading
         output_file = output_dir / "sequences.h5"
         with h5py.File(output_file, 'w') as f:
             f.create_dataset('X', data=X, compression='gzip')
             f.create_dataset('y', data=y, compression='gzip')
             f.create_dataset('timestamps', data=timestamps, compression='gzip')
+            f.create_dataset('train_masks', data=train_masks, compression='gzip')
             
             # Ensure subjects and recordings are strings before encoding
             subjects_encoded = [str(s).encode() for s in all_subjects]
@@ -294,6 +327,8 @@ class LSTMSequenceBuilder:
             f.attrs['seq_len'] = self.seq_len
             f.attrs['n_features'] = X.shape[-1]
             f.attrs['n_sequences'] = len(X)
+            f.attrs['n_trainable'] = int(n_trainable)
+            f.attrs['n_excluded'] = int(n_excluded)
             f.attrs['feature_names'] = [name.encode() for name in self.feature_names]
             f.attrs['normalized'] = self.normalize_features
             f.attrs['class_weights'] = list(class_weights)
@@ -301,6 +336,8 @@ class LSTMSequenceBuilder:
         # Save metadata as separate files
         metadata = {
             'n_sequences': len(X),
+            'n_trainable': int(n_trainable),
+            'n_excluded': int(n_excluded),
             'sequence_shape': X.shape,
             'feature_names': self.feature_names,
             'label_distribution': pd.Series(y).value_counts().to_dict(),

@@ -10,12 +10,19 @@ Creates minute-level feature packages with multi-temporal HRV features:
 - Each minute gets a bin label based on distance to closest seizure
 - 60-minute overlapping windows (30-minute overlap) for training
 - Dense supervision: probability distribution over seizure proximity bins
+- Ictal and post-ictal periods are masked from training but preserved for inference
 
-Bin definitions:
+Bin definitions (only for non-ictal, non-postictal minutes):
 - Bin 1: 0-5 minutes to seizure
 - Bin 2: 5-30 minutes to seizure  
 - Bin 3: 30-60 minutes to seizure
 - Bin 4: >60 minutes to seizure (no seizure in sight)
+
+Seizure masking:
+- Ictal minutes: During seizure (onset to onset+duration), excluded from training
+- Post-ictal minutes: 30 minutes after seizure onset, excluded from training
+- Recent seizure flag: Indicates post-seizure period for model inference
+- Training mask: 0 for excluded minutes, 1 for trainable minutes
 """
 
 import os
@@ -94,19 +101,36 @@ def process_single_run_worker(run_data: Dict, config: Dict) -> Optional[Dict]:
         total_minutes = len(features_df)
         total_windows = len(features_df.groupby(['window_start_time', 'window_end_time']))
         
+        # Check for padded data
+        padded_minutes = 0
+        if 'is_padded' in features_df.columns:
+            padded_minutes = int(features_df['is_padded'].sum())
+        
+        # Calculate seizure status counts
+        ictal_minutes = int(features_df['is_ictal'].sum()) if 'is_ictal' in features_df.columns else 0
+        postictal_minutes = int(features_df['is_postictal'].sum()) if 'is_postictal' in features_df.columns else 0
+        training_minutes = int(features_df['training_mask'].sum()) if 'training_mask' in features_df.columns else total_minutes
+        
         return {
             'subject': run_data['subject'],
             'session': run_data['session'],
             'run': run_data['run'],
             'n_minutes': total_minutes,
             'n_windows': total_windows,
+            'n_padded_minutes': padded_minutes,
+            'n_ictal_minutes': ictal_minutes,
+            'n_postictal_minutes': postictal_minutes,
+            'n_training_minutes': training_minutes,
             'bin_counts': bin_counts,
             'seizure_events': len(seizure_events),
             'output_file': str(output_file)
         }
         
     except Exception as e:
-        print(f"Worker error for {run_data['subject']}/{run_data['session']}/run-{run_data['run']}: {e}")
+        import traceback
+        error_msg = f"Worker error for {run_data['subject']}/{run_data['session']}/run-{run_data['run']}: {e}"
+        print(error_msg)
+        print(f"Full traceback: {traceback.format_exc()}")
         return None
 
 def main():
@@ -663,29 +687,58 @@ class HRVFeatureProcessor:
             if len(tachogram_result['filtered_rr']) == 0:
                 return pd.DataFrame()
             
-            # Extract seizure timestamps
+            # Extract seizure information (timestamps and durations)
             seizure_timestamps = []
+            has_seizures = False
             if not seizure_events.empty and 'onset' in seizure_events.columns:
                 seizure_timestamps = seizure_events['onset'].tolist()
+                has_seizures = len(seizure_timestamps) > 0
+            
+            # Check if recording is too short and should be skipped
+            total_duration_minutes = total_duration / 60.0
+            
+            if total_duration_minutes < 60 and not has_seizures:
+                # Skip short recordings without seizures - not useful for training
+                print(f"Skipping short recording ({total_duration_minutes:.1f} min) with no seizures")
+                return pd.DataFrame()
             
             # Create minute-level feature packages
             minute_packages = self._create_minute_packages(
-                tachogram_result, seizure_timestamps, total_duration
+                tachogram_result, seizure_events, total_duration
             )
             
+            if not minute_packages:
+                return pd.DataFrame()
+            
             # Create 60-minute overlapping windows from minute packages
+            # For short recordings with seizures, this will handle gracefully
             features_df = self._create_overlapping_windows(minute_packages)
+            
+            if features_df.empty:
+                return pd.DataFrame()
             
             # Add metadata columns
             features_df['subject_id'] = self._extract_subject_id(ecg_file)
             features_df['recording_id'] = Path(ecg_file).stem
             
-            # Reorder columns
+            # Reorder columns - check if all expected columns exist first
             metadata_cols = ['subject_id', 'recording_id', 'window_start_time', 
-                            'window_end_time', 'minute_time']
-            feature_cols = [col for col in features_df.columns 
-                           if col not in metadata_cols + ['bin_1', 'bin_2', 'bin_3', 'bin_4', 'mask']]
-            ordered_cols = metadata_cols + feature_cols + ['bin_1', 'bin_2', 'bin_3', 'bin_4', 'mask']
+                            'window_end_time', 'minute_time', 'minute_in_window']
+            bin_cols = ['bin_1', 'bin_2', 'bin_3', 'bin_4']
+            seizure_status_cols = ['is_ictal', 'is_postictal', 'recent_seizure_flag']
+            special_cols = ['training_mask', 'mask', 'is_padded']
+            
+            # Only include columns that actually exist
+            existing_metadata_cols = [col for col in metadata_cols if col in features_df.columns]
+            existing_bin_cols = [col for col in bin_cols if col in features_df.columns] 
+            existing_seizure_cols = [col for col in seizure_status_cols if col in features_df.columns]
+            existing_special_cols = [col for col in special_cols if col in features_df.columns]
+            
+            all_system_cols = metadata_cols + bin_cols + seizure_status_cols + special_cols
+            feature_cols = [col for col in features_df.columns if col not in all_system_cols]
+            
+            ordered_cols = (existing_metadata_cols + feature_cols + existing_bin_cols + 
+                          existing_seizure_cols + existing_special_cols)
             features_df = features_df[ordered_cols]
             
             return features_df
@@ -698,7 +751,7 @@ class HRVFeatureProcessor:
                 os.unlink(ecg_local_file)
     
     def _create_minute_packages(self, tachogram_result: Dict, 
-                              seizure_timestamps: List[float], 
+                              seizure_events: pd.DataFrame, 
                               total_duration: float) -> List[Dict]:
         """Create minute-level feature packages with multi-temporal HRV features."""
         rr_intervals = tachogram_result['filtered_rr']
@@ -721,7 +774,7 @@ class HRVFeatureProcessor:
             
             # Create feature package for this minute
             package = self._create_single_minute_package(
-                minute_start_time, rr_intervals, rr_times, seizure_timestamps
+                minute_start_time, rr_intervals, rr_times, seizure_events
             )
             
             if package is not None:
@@ -732,25 +785,45 @@ class HRVFeatureProcessor:
     def _create_single_minute_package(self, minute_time: float, 
                                     rr_intervals: np.ndarray, 
                                     rr_times: np.ndarray,
-                                    seizure_timestamps: List[float]) -> Dict:
+                                    seizure_events: pd.DataFrame) -> Dict:
         """Create a single minute feature package with multi-temporal features."""
         
-        # Initialize feature package
-        package = {
-            'minute_time': minute_time,
-            'mask': {}  # Track which features are available
-        }
-        
-        # Calculate features for different time windows
-        self._add_3min_features(package, minute_time, rr_intervals, rr_times)
-        self._add_5min_features(package, minute_time, rr_intervals, rr_times)
-        self._add_10min_features(package, minute_time, rr_intervals, rr_times)
-        
-        # Calculate seizure proximity bin
-        bin_label = self._calculate_seizure_proximity_bin(minute_time, seizure_timestamps)
-        package.update(bin_label)
-        
-        return package
+        try:
+            # Initialize feature package
+            package = {
+                'minute_time': minute_time,
+                'mask': {}  # Track which features are available
+            }
+            
+            # Calculate features for different time windows
+            self._add_3min_features(package, minute_time, rr_intervals, rr_times)
+            self._add_5min_features(package, minute_time, rr_intervals, rr_times)
+            self._add_10min_features(package, minute_time, rr_intervals, rr_times)
+            
+            # Calculate seizure proximity bin and ictal/post-ictal status
+            seizure_info = self._calculate_seizure_status(minute_time, seizure_events)
+            package.update(seizure_info)
+            
+            # Ensure all required fields are present
+            required_fields = ['bin_1', 'bin_2', 'bin_3', 'bin_4', 'is_ictal', 'is_postictal', 
+                             'recent_seizure_flag', 'training_mask']
+            for field in required_fields:
+                if field not in package:
+                    if field == 'training_mask':
+                        package[field] = 1  # Default to usable for training
+                    else:
+                        package[field] = 0  # Default to 0 if missing
+            
+            return package
+            
+        except Exception as e:
+            # Return a minimal valid package if there's an error
+            return {
+                'minute_time': minute_time,
+                'mask': {},
+                'bin_1': 0, 'bin_2': 0, 'bin_3': 0, 'bin_4': 1,  # Default to bin 4 (no seizure)
+                'is_ictal': 0, 'is_postictal': 0, 'recent_seizure_flag': 0, 'training_mask': 1
+            }
     
     def _add_3min_features(self, package: Dict, minute_time: float, 
                           rr_intervals: np.ndarray, rr_times: np.ndarray):
@@ -854,48 +927,162 @@ class HRVFeatureProcessor:
                 package[f"{feature}_10"] = 0.0
                 package['mask'][f"{feature}_10"] = 0
     
-    def _calculate_seizure_proximity_bin(self, minute_time: float, 
-                                        seizure_timestamps: List[float]) -> Dict:
+    def _calculate_seizure_status(self, minute_time: float, 
+                                 seizure_events: pd.DataFrame) -> Dict:
         """
-        Calculate seizure proximity bin for a minute package.
+        Calculate comprehensive seizure status for a minute package.
         
         Args:
             minute_time: Time of the minute in seconds
-            seizure_timestamps: List of seizure onset times in seconds
+            seizure_events: DataFrame with 'onset' and optionally 'duration' columns
             
         Returns:
-            Dictionary with bin labels (one-hot encoded)
+            Dictionary with seizure proximity bins, ictal/postictal status, and training mask
         """
-        if not seizure_timestamps:
+        if seizure_events.empty:
             # No seizures - Bin 4 (>60 minutes)
-            return {'bin_1': 0, 'bin_2': 0, 'bin_3': 0, 'bin_4': 1}
+            return {
+                'bin_1': 0, 'bin_2': 0, 'bin_3': 0, 'bin_4': 1,
+                'is_ictal': 0, 'is_postictal': 0, 'recent_seizure_flag': 0,
+                'training_mask': 1  # Can use for training
+            }
         
-        # Find closest seizure
-        min_distance = float('inf')
-        for ts in seizure_timestamps:
-            distance = abs(ts - minute_time) / 60.0  # Convert to minutes
-            if distance < min_distance:
-                min_distance = distance
+        # Extract seizure information
+        is_ictal = 0
+        is_postictal = 0
+        recent_seizure_flag = 0
+        training_mask = 1  # Default: can use for training
         
-        # Determine bin based on distance
-        if 0 <= min_distance < 5:
-            return {'bin_1': 1, 'bin_2': 0, 'bin_3': 0, 'bin_4': 0}  # Bin 1: 0-5 min
-        elif 5 <= min_distance < 30:
-            return {'bin_1': 0, 'bin_2': 1, 'bin_3': 0, 'bin_4': 0}  # Bin 2: 5-30 min
-        elif 30 <= min_distance < 60:
-            return {'bin_1': 0, 'bin_2': 0, 'bin_3': 1, 'bin_4': 0}  # Bin 3: 30-60 min
+        # Check each seizure event
+        for _, seizure in seizure_events.iterrows():
+            seizure_start = seizure['onset']
+            seizure_duration = seizure.get('duration', 60)  # Default 1 minute if no duration
+            seizure_end = seizure_start + seizure_duration
+            
+            # Check if minute is during seizure (ictal)
+            if seizure_start <= minute_time < seizure_end:
+                is_ictal = 1
+                training_mask = 0  # Don't use ictal minutes for training
+                break
+            
+            # Check if minute is in post-ictal refractory period (30 minutes after seizure start)
+            time_since_seizure_start = (minute_time - seizure_start) / 60.0  # Convert to minutes
+            if 0 <= time_since_seizure_start <= 30:  # Up to 30 minutes after seizure start
+                is_postictal = 1
+                recent_seizure_flag = 1  # Model feature: knows it's post-seizure
+                training_mask = 0  # Don't use post-ictal minutes for training
+        
+        # If not ictal or post-ictal, calculate proximity bins
+        if not is_ictal and not is_postictal:  
+            # Find closest seizure for proximity binning
+            seizure_timestamps = seizure_events['onset'].tolist()
+            min_distance = float('inf')
+            for ts in seizure_timestamps:
+                distance = abs(ts - minute_time) / 60.0  # Convert to minutes
+                if distance < min_distance:
+                    min_distance = distance
+            
+            # Determine bin based on distance (only for non-ictal, non-postictal minutes)
+            if 0 <= min_distance < 5:
+                bin_labels = {'bin_1': 1, 'bin_2': 0, 'bin_3': 0, 'bin_4': 0}  # Bin 1: 0-5 min
+            elif 5 <= min_distance < 30:
+                bin_labels = {'bin_1': 0, 'bin_2': 1, 'bin_3': 0, 'bin_4': 0}  # Bin 2: 5-30 min
+            elif 30 <= min_distance < 60:
+                bin_labels = {'bin_1': 0, 'bin_2': 0, 'bin_3': 1, 'bin_4': 0}  # Bin 3: 30-60 min
+            else:
+                bin_labels = {'bin_1': 0, 'bin_2': 0, 'bin_3': 0, 'bin_4': 1}  # Bin 4: >=60 min
         else:
-            return {'bin_1': 0, 'bin_2': 0, 'bin_3': 0, 'bin_4': 1}  # Bin 4: >=60 min
+            # For ictal/post-ictal minutes, don't assign proximity bins (all zeros)
+            bin_labels = {'bin_1': 0, 'bin_2': 0, 'bin_3': 0, 'bin_4': 0}
+        
+        return {
+            **bin_labels,
+            'is_ictal': is_ictal,
+            'is_postictal': is_postictal, 
+            'recent_seizure_flag': recent_seizure_flag,
+            'training_mask': training_mask
+        }
     
     def _create_overlapping_windows(self, minute_packages: List[Dict]) -> pd.DataFrame:
         """Create 60-minute overlapping windows from minute packages."""
-        if len(minute_packages) < 60:
-            return pd.DataFrame()  # Need at least 60 minutes
-        
         results = []
         step_size = 30  # 30-minute overlap
         
-        # Create overlapping 60-minute windows
+        if len(minute_packages) < 60:
+            # For short recordings, check if they contain seizures
+            has_seizures = any(pkg.get('bin_1', 0) == 1 or pkg.get('bin_2', 0) == 1 
+                             for pkg in minute_packages)
+            
+            if not has_seizures:
+                return pd.DataFrame()  # Skip short recordings without seizures
+            
+            # For short recordings with seizures, create a single window with available data
+            # Pad with the last available package to reach 60 minutes if needed
+            if minute_packages:
+                padded_packages = minute_packages[:]
+                last_package = minute_packages[-1].copy()
+                
+                # Pad to 60 minutes by repeating the last package
+                while len(padded_packages) < 60:
+                    padded_packages.append(last_package.copy())
+                
+                # Create single window from padded data
+                window_start_time = padded_packages[0]['minute_time']
+                window_end_time = padded_packages[59]['minute_time'] + 60
+                
+                for j, package in enumerate(padded_packages):
+                    # Check if package has all required fields
+                    required_keys = ['minute_time', 'bin_1', 'bin_2', 'bin_3', 'bin_4', 
+                                   'is_ictal', 'is_postictal', 'recent_seizure_flag', 'training_mask']
+                    if not all(key in package for key in required_keys):
+                        continue  # Skip malformed packages
+                        
+                    # Flatten the package into a row
+                    row = {
+                        'window_start_time': window_start_time,
+                        'window_end_time': window_end_time,
+                        'minute_time': package['minute_time'],
+                        'minute_in_window': j,
+                        'bin_1': package['bin_1'],
+                        'bin_2': package['bin_2'], 
+                        'bin_3': package['bin_3'],
+                        'bin_4': package['bin_4'],
+                        'is_ictal': package['is_ictal'],
+                        'is_postictal': package['is_postictal'],
+                        'recent_seizure_flag': package['recent_seizure_flag'],
+                        'training_mask': package['training_mask'],
+                        'is_padded': j >= len(minute_packages)  # Mark padded data
+                    }
+                    
+                    # Add all features (excluding metadata and seizure fields)
+                    excluded_keys = ['minute_time', 'bin_1', 'bin_2', 'bin_3', 'bin_4', 'mask',
+                                   'is_ictal', 'is_postictal', 'recent_seizure_flag', 'training_mask']
+                    for key, value in package.items():
+                        if key not in excluded_keys:
+                            row[key] = value
+                    
+                    # Add mask as binary features
+                    mask_dict = package.get('mask', {})
+                    mask_features = []
+                    for feature_group in ['3', '5', '10']:
+                        for base_feature in self.feature_windows[f'{feature_group}min']:
+                            feature_name = f"{base_feature}_{feature_group}"
+                            mask_value = mask_dict.get(feature_name, 0)
+                            mask_features.append(mask_value)
+                    
+                    # Convert mask to single value (can be expanded later)
+                    if mask_features:
+                        row['mask'] = int(np.mean(mask_features))  # Average availability
+                    else:
+                        row['mask'] = 0  # No features available
+                    
+                    results.append(row)
+                
+                return pd.DataFrame(results)
+            
+            return pd.DataFrame()
+        
+        # Create overlapping 60-minute windows for normal-length recordings
         for i in range(0, len(minute_packages) - 59, step_size):
             window_packages = minute_packages[i:i+60]
             
@@ -907,6 +1094,12 @@ class HRVFeatureProcessor:
             
             # Create rows for each minute in the window
             for j, package in enumerate(window_packages):
+                # Check if package has all required fields
+                required_keys = ['minute_time', 'bin_1', 'bin_2', 'bin_3', 'bin_4', 
+                               'is_ictal', 'is_postictal', 'recent_seizure_flag', 'training_mask']
+                if not all(key in package for key in required_keys):
+                    continue  # Skip malformed packages
+                    
                 # Flatten the package into a row
                 row = {
                     'window_start_time': window_start_time,
@@ -916,12 +1109,19 @@ class HRVFeatureProcessor:
                     'bin_1': package['bin_1'],
                     'bin_2': package['bin_2'], 
                     'bin_3': package['bin_3'],
-                    'bin_4': package['bin_4']
+                    'bin_4': package['bin_4'],
+                    'is_ictal': package['is_ictal'],
+                    'is_postictal': package['is_postictal'],
+                    'recent_seizure_flag': package['recent_seizure_flag'],
+                    'training_mask': package['training_mask'],
+                    'is_padded': False  # Normal recordings are not padded
                 }
                 
-                # Add all features (excluding metadata)
+                # Add all features (excluding metadata and seizure fields)
+                excluded_keys = ['minute_time', 'bin_1', 'bin_2', 'bin_3', 'bin_4', 'mask',
+                               'is_ictal', 'is_postictal', 'recent_seizure_flag', 'training_mask']
                 for key, value in package.items():
-                    if key not in ['minute_time', 'bin_1', 'bin_2', 'bin_3', 'bin_4', 'mask']:
+                    if key not in excluded_keys:
                         row[key] = value
                 
                 # Add mask as binary features
@@ -934,7 +1134,10 @@ class HRVFeatureProcessor:
                         mask_features.append(mask_value)
                 
                 # Convert mask to single value (can be expanded later)
-                row['mask'] = int(np.mean(mask_features))  # Average availability
+                if mask_features:
+                    row['mask'] = int(np.mean(mask_features))  # Average availability
+                else:
+                    row['mask'] = 0  # No features available
                 
                 results.append(row)
         
@@ -1211,7 +1414,13 @@ class DataProcessingPipeline:
         total_windows = summary_df['n_windows'].sum()
         total_seizure_events = summary_df['seizure_events'].sum()
         
-        # Calculate overall bin distribution
+        # Calculate seizure status totals 
+        total_ictal = summary_df['n_ictal_minutes'].sum() if 'n_ictal_minutes' in summary_df.columns else 0
+        total_postictal = summary_df['n_postictal_minutes'].sum() if 'n_postictal_minutes' in summary_df.columns else 0
+        total_training = summary_df['n_training_minutes'].sum() if 'n_training_minutes' in summary_df.columns else total_minutes
+        total_excluded = total_minutes - total_training
+        
+        # Calculate overall bin distribution (only for trainable minutes)
         total_bin_1 = sum(result['bin_counts'].get('bin_1', 0) for result in self.processing_results)
         total_bin_2 = sum(result['bin_counts'].get('bin_2', 0) for result in self.processing_results)
         total_bin_3 = sum(result['bin_counts'].get('bin_3', 0) for result in self.processing_results)
@@ -1224,11 +1433,18 @@ class DataProcessingPipeline:
         print(f"Total minute packages: {total_minutes:,}")
         print(f"Total 60-min windows: {total_windows:,}")
         print(f"Total seizure events: {total_seizure_events}")
-        print(f"\nOverall seizure proximity bin distribution:")
-        print(f"  Bin 1 (0-5 min): {total_bin_1:,} ({total_bin_1/total_minutes*100:.1f}%)")
-        print(f"  Bin 2 (5-30 min): {total_bin_2:,} ({total_bin_2/total_minutes*100:.1f}%)")
-        print(f"  Bin 3 (30-60 min): {total_bin_3:,} ({total_bin_3/total_minutes*100:.1f}%)")
-        print(f"  Bin 4 (>60 min): {total_bin_4:,} ({total_bin_4/total_minutes*100:.1f}%)")
+        
+        print(f"\nSeizure Status Distribution:")
+        print(f"  Ictal minutes (excluded): {total_ictal:,} ({total_ictal/total_minutes*100:.1f}%)")
+        print(f"  Post-ictal minutes (excluded): {total_postictal:,} ({total_postictal/total_minutes*100:.1f}%)")
+        print(f"  Training minutes (usable): {total_training:,} ({total_training/total_minutes*100:.1f}%)")
+        print(f"  Excluded from training: {total_excluded:,} ({total_excluded/total_minutes*100:.1f}%)")
+        
+        print(f"\nSeizure Proximity Bin Distribution (trainable minutes only):")
+        print(f"  Bin 1 (0-5 min): {total_bin_1:,} ({total_bin_1/total_training*100:.1f}% of trainable)")
+        print(f"  Bin 2 (5-30 min): {total_bin_2:,} ({total_bin_2/total_training*100:.1f}% of trainable)")
+        print(f"  Bin 3 (30-60 min): {total_bin_3:,} ({total_bin_3/total_training*100:.1f}% of trainable)")
+        print(f"  Bin 4 (>60 min): {total_bin_4:,} ({total_bin_4/total_training*100:.1f}% of trainable)")
         
         # Save summary
         if self.s3_handler.is_s3_path(self.output_dir):

@@ -238,7 +238,7 @@ class S3FileHandler:
             raise RuntimeError("S3 not available")
         
         local_files = {}
-        max_workers = min(len(s3_paths), 4)  # Limit concurrent downloads
+        max_workers = min(len(s3_paths), 15)  # Limit concurrent downloads
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_s3path = {

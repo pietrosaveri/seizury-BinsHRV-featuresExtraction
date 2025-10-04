@@ -1620,7 +1620,7 @@ def main():
 
     # Configuration - AWS S3 (comment out if using local files)
     data_root = args.data_root or "s3://seizury-data/ds005873"
-    output_dir = args.output_dir or "s3://seizury-data/60min_overlapping_hrv_features"
+    output_dir = args.output_dir or "s3://seizury-data/interpolation_60min_overlapping_hrv_features"
 
     # Performance settings for m7i-flex.large (2 vCPUs, 8GB RAM)
     n_workers = args.n_workers  # Use specified number of workers

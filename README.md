@@ -1,10 +1,17 @@
 # HRV-Based Seizure Proximity Probability Prediction
 
-This pipeline processes ECG data to create minute-level feature packages for predicting seizure proximity probability distributions using multi-temporal HRV features.
+This pipeline processes ECG data to create minute-level feature packages for predicting seizure proximity probability distributions using multi-temporal HRV features with proper interpolation-based frequency-domain analysis.
 
 ## Overview
 
 Instead of predicting exact time-to-seizure, the model predicts probability distributions over how far each minute is from the nearest seizure. This approach provides more robust seizure monitoring by giving probabilistic assessments of seizure risk.
+
+## Key Features
+
+- **Medically Compliant Interpolation**: 4 Hz cubic spline interpolation for accurate frequency-domain HRV analysis following Task Force guidelines
+- **Multi-Temporal Analysis**: HRV features calculated from multiple historical windows (3, 5, 10 minutes)
+- **Seizure Validation**: 20-minute minimum duration with 30-minute post-ictal exclusion periods
+- **Class Imbalance Handling**: Balanced training with focal loss and class weights for medical datasets
 
 ## Approach
 
@@ -73,7 +80,28 @@ Minute packages are organized into 60-minute overlapping windows:
 - **Dense supervision**: Each minute within the window gets its own bin label
 - **Training**: Loss is averaged across all 60 minutes in each window
 
-### 5. Feature Availability Masking
+### 5. HRV Frequency-Domain Interpolation
+
+Accurate frequency-domain analysis requires proper interpolation of irregularly sampled RR intervals:
+
+#### Interpolation Method
+- **Cubic Spline Interpolation**: Used to create uniformly sampled tachogram
+- **Sampling Rate**: 4 Hz resampling following Task Force recommendations
+- **Implementation**: `scipy.interpolate.interp1d` with cubic splines and extrapolation handling
+
+#### Frequency Analysis Pipeline
+1. **RR Interval Collection**: Gather RR intervals with their timestamps
+2. **Cubic Interpolation**: Resample to uniform 4 Hz grid using spline interpolation  
+3. **Welch's Method**: Apply Welch PSD estimation on interpolated signal
+4. **Power Integration**: Integrate power in VLF (0.003-0.04 Hz), LF (0.04-0.15 Hz), and HF (0.15-0.4 Hz) bands
+5. **Unit Conversion**: Convert to ms² units matching medical standards
+
+#### Medical Compliance
+- Follows Task Force of the European Society of Cardiology guidelines
+- Ensures accurate VLF, LF, and HF power estimation for seizure prediction
+- Maintains physiological interpretation of autonomic balance (LF/HF ratio)
+
+### 6. Feature Availability Masking
 
 When insufficient historical data is available (e.g., at recording start):
 - Missing features are set to `0.0`

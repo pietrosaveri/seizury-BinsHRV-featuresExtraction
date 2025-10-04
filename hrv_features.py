@@ -99,12 +99,69 @@ class HRVFeatureExtractor:
             'RRVar': rr_var
         }
     
+    def interpolate_rr_intervals(self, rr_intervals: np.ndarray, 
+                               rr_times: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Interpolate RR intervals to uniform sampling using cubic spline.
+        
+        This is essential for accurate frequency-domain analysis as recommended
+        by the Task Force of the European Society of Cardiology.
+        
+        Args:
+            rr_intervals: RR intervals in seconds
+            rr_times: Times corresponding to RR intervals in seconds
+            
+        Returns:
+            Tuple of (interpolated_rr, uniform_times)
+        """
+        # Handle empty or insufficient input
+        if len(rr_intervals) == 0 or len(rr_times) == 0:
+            return np.array([]), np.array([])
+            
+        if len(rr_intervals) < 2 or len(rr_times) < 2:
+            # Need at least 2 points for interpolation
+            return np.array([]), np.array([])
+        
+        # Create uniform time vector at resampling rate
+        start_time = rr_times[0]
+        end_time = rr_times[-1]
+        time_span = end_time - start_time
+        
+        if time_span <= 0:
+            return np.array([]), np.array([])
+            
+        uniform_times = np.arange(start_time, end_time, 1/self.resampling_rate)
+        
+        if len(uniform_times) < 2:
+            # Not enough points for meaningful analysis
+            return np.array([]), np.array([])
+        
+        # Cubic spline interpolation
+        try:
+            interp_func = interpolate.interp1d(rr_times, rr_intervals, 
+                                             kind='cubic', 
+                                             bounds_error=False,
+                                             fill_value='extrapolate')
+            interpolated_rr = interp_func(uniform_times)
+            
+            # Remove any invalid values
+            valid_mask = np.isfinite(interpolated_rr)
+            if not np.any(valid_mask):
+                return np.array([]), np.array([])
+                
+            return interpolated_rr[valid_mask], uniform_times[valid_mask]
+            
+        except Exception as e:
+            warnings.warn(f"RR interval interpolation failed: {e}")
+            return np.array([]), np.array([])
+
     def compute_frequency_features(self, rr_intervals: np.ndarray, 
                                  rr_times: np.ndarray) -> Dict[str, float]:
         """
-        Compute frequency-domain HRV features using Lomb-Scargle periodogram.
+        Compute frequency-domain HRV features using interpolation-based PSD.
         
-        Matches the output of frequency_features.m from MATLAB codebase.
+        Uses cubic spline interpolation for uniform sampling followed by
+        Welch's method for PSD estimation, as recommended for HRV analysis.
         
         Args:
             rr_intervals: RR intervals in seconds
@@ -117,23 +174,20 @@ class HRVFeatureExtractor:
             return self._get_empty_frequency_features()
         
         try:
-            # Compute Lomb-Scargle periodogram for irregularly sampled data
-            # Using beat numbers as in MATLAB code
-            beat_numbers = np.arange(1, len(rr_intervals) + 1)
+            # Use interpolation-based approach as primary method
+            interpolated_rr, uniform_times = self.interpolate_rr_intervals(rr_intervals, rr_times)
             
-            # Frequency range for analysis
-            f_min = 0.001  # Minimum frequency
-            f_max = 0.5    # Maximum frequency (well below Nyquist)
-            freqs = np.linspace(f_min, f_max, 1000)
+            if len(interpolated_rr) < 10:
+                # Fallback to Lomb-Scargle for very short segments
+                return self._compute_lombscargle_features(rr_intervals, rr_times)
             
-            # Compute Lomb-Scargle periodogram
-            if HAS_LOMBSCARGLE:
-                # Use angular frequencies for scipy.signal.lombscargle
-                omega = 2 * np.pi * freqs
-                psd = lombscargle(beat_numbers, rr_intervals, omega, normalize=True)
-            else:
-                # Fallback: use interpolation + Welch method
-                psd, freqs = self._compute_welch_psd(rr_intervals, rr_times)
+            # Compute Welch PSD on interpolated data  
+            freqs, psd = signal.welch(interpolated_rr, 
+                                    fs=self.resampling_rate,
+                                    nperseg=min(256, len(interpolated_rr)//2),
+                                    noverlap=None,
+                                    window='hann',
+                                    detrend='constant')
             
             # Compute power in frequency bands
             total_power = self._compute_band_power(psd, freqs, [freqs[0], freqs[-1]])
@@ -171,28 +225,90 @@ class HRVFeatureExtractor:
             warnings.warn(f"Frequency analysis failed: {e}")
             return self._get_empty_frequency_features()
     
+    def _compute_lombscargle_features(self, rr_intervals: np.ndarray, 
+                                    rr_times: np.ndarray) -> Dict[str, float]:
+        """
+        Fallback method using Lomb-Scargle periodogram for very short segments.
+        """
+        try:
+            # Use beat numbers as in original MATLAB code
+            beat_numbers = np.arange(1, len(rr_intervals) + 1)
+            
+            # Frequency range for analysis
+            f_min = 0.001  # Minimum frequency
+            f_max = 0.5    # Maximum frequency
+            freqs = np.linspace(f_min, f_max, 1000)
+            
+            # Compute Lomb-Scargle periodogram
+            if HAS_LOMBSCARGLE:
+                # Use angular frequencies for scipy.signal.lombscargle  
+                omega = 2 * np.pi * freqs
+                psd = lombscargle(beat_numbers, rr_intervals, omega, normalize=True)
+            else:
+                # Final fallback: simple interpolation + Welch
+                psd, freqs = self._compute_welch_psd(rr_intervals, rr_times)
+            
+            # Compute power in frequency bands (same as main method)
+            total_power = self._compute_band_power(psd, freqs, [freqs[0], freqs[-1]])
+            vlf_power = self._compute_band_power(psd, freqs, self.vlf_band)
+            lf_power = self._compute_band_power(psd, freqs, self.lf_band)
+            hf_power = self._compute_band_power(psd, freqs, self.hf_band)
+            
+            # Convert to ms^2 units
+            scale_factor = 1e6
+            total_power *= scale_factor
+            vlf_power *= scale_factor
+            lf_power *= scale_factor
+            hf_power *= scale_factor
+            
+            # Normalized power
+            vlf_norm = (vlf_power / total_power) * 100 if total_power > 0 else 0.0
+            lf_norm = (lf_power / total_power) * 100 if total_power > 0 else 0.0
+            hf_norm = (hf_power / total_power) * 100 if total_power > 0 else 0.0
+            
+            # LF/HF ratio
+            lf_to_hf = lf_power / hf_power if hf_power > 0 else 0.0
+            
+            return {
+                'TOTAL_POWER': total_power,
+                'VLF_POWER': vlf_power,
+                'LF_POWER': lf_power,
+                'HF_POWER': hf_power,
+                'VLF_NORM': vlf_norm,
+                'LF_NORM': lf_norm,
+                'HF_NORM': hf_norm,
+                'LF_TO_HF': lf_to_hf
+            }
+            
+        except Exception as e:
+            warnings.warn(f"Lomb-Scargle analysis failed: {e}")
+            return self._get_empty_frequency_features()
+    
     def _compute_welch_psd(self, rr_intervals: np.ndarray, 
                           rr_times: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Fallback method using interpolation + Welch PSD.
+        Final fallback method using simple interpolation + Welch PSD.
         """
-        # Interpolate to uniform sampling
-        time_uniform = np.arange(rr_times[0], rr_times[-1], 1/self.resampling_rate)
-        
-        if len(time_uniform) < 10:
-            # Not enough points for interpolation
+        try:
+            # Use the dedicated interpolation method
+            interpolated_rr, uniform_times = self.interpolate_rr_intervals(rr_intervals, rr_times)
+            
+            if len(interpolated_rr) < 10:
+                # Return empty arrays if interpolation failed
+                freqs = np.linspace(0.001, 0.5, 100)
+                return np.zeros_like(freqs), freqs
+            
+            # Compute Welch PSD
+            freqs, psd = signal.welch(interpolated_rr, 
+                                    fs=self.resampling_rate, 
+                                    nperseg=min(256, len(interpolated_rr)//2))
+            
+            return psd, freqs
+            
+        except Exception:
+            # Ultimate fallback
             freqs = np.linspace(0.001, 0.5, 100)
             return np.zeros_like(freqs), freqs
-        
-        interp_func = interpolate.interp1d(rr_times, rr_intervals, 
-                                         kind='cubic', fill_value='extrapolate')
-        rr_uniform = interp_func(time_uniform)
-        
-        # Compute Welch PSD
-        freqs, psd = signal.welch(rr_uniform, fs=self.resampling_rate, 
-                                 nperseg=min(256, len(rr_uniform)//2))
-        
-        return psd, freqs
     
     def _compute_band_power(self, psd: np.ndarray, freqs: np.ndarray, 
                            band: List[float]) -> float:

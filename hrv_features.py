@@ -181,6 +181,7 @@ class HRVFeatureExtractor:
                 # Fallback to Lomb-Scargle for very short segments
                 return self._compute_lombscargle_features(rr_intervals, rr_times)
             
+            # QUI DOBBIAMO SPLITTARE I CASI: DIVERSI MINUTI
             # Compute Welch PSD on interpolated data  
             freqs, psd = signal.welch(interpolated_rr, 
                                     fs=self.resampling_rate,
